@@ -1,0 +1,307 @@
+Nice brief — great idea. I’ll be proactive and give you **both**:
+
+1. a compact **project architecture + step-by-step development plan** you can follow, and
+2. a **ready-to-run minimal prototype** (Python) — a Streamlit frontend + FastAPI backend example that **accepts a JSON + Excel**, transforms technical names into plain English (simple rule-based NLP + optional LLM hooks), and **generates a .docx** using `python-docx`.
+
+You can pick and extend either path — the prototype is intentionally minimal so you can iterate quickly.
+
+---
+
+# 1) High-level architecture (textual diagram)
+
+```
+[User Browser / Streamlit UI]
+   ├─ Upload JSON (template) & Excel (technical doc)
+   ├─ Preview parsed fields (optional)
+   └─ "Generate Doc" -> POST files -> FastAPI
+
+[FastAPI Backend]
+   ├─ /parse  : parse JSON + Excel -> canonical internal model
+   ├─ /explain: transform field names & rules -> plain-English (rule-based + LLM optional)
+   └─ /generate: create .docx from canonical model -> return file
+
+[Processing Layer]
+   ├─ JSON parser -> extract metadata, rulesets, mappings
+   ├─ Excel parser -> using pandas -> detect sheets, column names, descriptions, formulas
+   ├─ Mapper -> align JSON fields ↔ Excel columns (fuzzy matching)
+   ├─ Transformer (NLP) -> short plain-English sentences
+   └─ Word generator -> python-docx (structured headings, tables, summaries)
+
+[Optional: LLM service]
+   └─ for advanced plain-English conversions — called from Transformer (async call but sync for prototype)
+
+[Storage / Logging]
+   └─ ephemeral file store or S3 (optional)
+```
+
+---
+
+# 2) Step-by-step development plan (milestones)
+
+1. **Prototype (1)** — single-process Streamlit app that reads JSON+Excel and produces a .docx using rule-based translations. (fastest path)
+2. **API split (2)** — build FastAPI backend with endpoints for parsing, explaining, and generating docx. Keep Streamlit as light frontend.
+3. **Mapping improvements (3)** — implement fuzzy matching (e.g., `fuzzywuzzy` or `rapidfuzz`) to align fields.
+4. **NLP improvements (4)** — add small rule-based templates for common patterns; add optional LLM integration for complex wording.
+5. **Testing & Edge cases (5)** — test with many templates, validate date/number formats, formulas, v-lookup/transforms.
+6. **UX polishing (6)** — provide preview pane with editable plain-language text before Word generation.
+7. **Deployment (7)** — containerize with Docker, host backend (e.g., Cloud Run / ECS), serve frontend via static site or Streamlit sharing.
+
+---
+
+# 3) Minimal prototype — code (Streamlit frontend + FastAPI backend)
+
+Below are two files you can use locally. They are minimal but functional.
+
+## Requirements
+
+`pip install fastapi uvicorn python-multipart python-docx pandas openpyxl rapidfuzz streamlit requests`
+
+---
+
+## a) `backend.py` — FastAPI backend
+
+Save as `backend.py` and run with `uvicorn backend:app --reload --port 8000`
+
+```python
+# backend.py
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import FileResponse, JSONResponse
+import shutil, os, uuid, json
+import pandas as pd
+from pathlib import Path
+from docx import Document
+from typing import Tuple
+from rapidfuzz import process, fuzz
+
+app = FastAPI()
+TMP = Path("./tmp")
+TMP.mkdir(exist_ok=True)
+
+def save_upload(file: UploadFile) -> Path:
+    token = uuid.uuid4().hex
+    out = TMP / f"{token}_{file.filename}"
+    with out.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return out
+
+def parse_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def parse_excel(path: Path) -> dict:
+    xls = pd.read_excel(path, sheet_name=None)
+    parsed = {}
+    for name, df in xls.items():
+        parsed[name] = {
+            "columns": list(df.columns),
+            "sample": df.head(5).to_dict(orient="records")
+        }
+    return parsed
+
+def fuzzy_map(json_fields: list, excel_columns: list, limit=1) -> dict:
+    # map each json field to best excel column using rapidfuzz
+    mapping = {}
+    for jf in json_fields:
+        candidate, score, _ = process.extractOne(jf, excel_columns, scorer=fuzz.WRatio)
+        mapping[jf] = {"best_match": candidate, "score": score}
+    return mapping
+
+def rule_to_plain(rule: dict) -> str:
+    """
+    Basic rule-to-plain conversion. Expand as needed.
+    Expects rule like {'type':'if','expr':'amount != matched','action':'flag'}
+    """
+    expr = rule.get("expr") or rule.get("condition") or str(rule)
+    # simple replacements
+    expr = expr.replace("!=", "does not equal").replace("==","equals")
+    expr = expr.replace("AND","and").replace("OR","or")
+    action = rule.get("action", "")
+    if action:
+        return f"If {expr}, then {action}."
+    return f"Rule: {expr}."
+
+def generate_docx(title: str, summary: str, data_sources: dict, rules: list, out_path: Path):
+    doc = Document()
+    doc.add_heading(title, level=1)
+    doc.add_paragraph(summary)
+
+    doc.add_heading("Data Sources", level=2)
+    for k,v in data_sources.items():
+        doc.add_heading(k, level=3)
+        doc.add_paragraph("Columns: " + ", ".join(v.get("columns", [])))
+        doc.add_paragraph("Sample (first rows):")
+        table_data = v.get("sample", [])
+        if table_data:
+            # make a small table
+            cols = list(table_data[0].keys())
+            table = doc.add_table(rows=1, cols=len(cols))
+            hdr = table.rows[0].cells
+            for i,c in enumerate(cols):
+                hdr[i].text = str(c)
+            for row in table_data:
+                r = table.add_row().cells
+                for i,c in enumerate(cols):
+                    r[i].text = str(row.get(c, ""))
+
+    doc.add_heading("Reconciliation Rules (plain language)", level=2)
+    for r in rules:
+        doc.add_paragraph(rule_to_plain(r), style=None)
+
+    doc.add_heading("Notes", level=2)
+    doc.add_paragraph("This summary was auto-generated. Please review for business accuracy.")
+    doc.save(out_path)
+
+@app.post("/generate")
+async def generate(json_file: UploadFile = File(...), excel_file: UploadFile = File(...)):
+    # 1) save
+    jpath = save_upload(json_file)
+    xpath = save_upload(excel_file)
+    try:
+        meta = parse_json(jpath)
+    except Exception as e:
+        return JSONResponse({"error":"invalid json","details":str(e)}, status_code=400)
+
+    try:
+        excel_parsed = parse_excel(xpath)
+    except Exception as e:
+        return JSONResponse({"error":"invalid excel","details":str(e)}, status_code=400)
+
+    # 2) extract fields from JSON for mapping (example: look for 'columns' names if present)
+    json_field_candidates = []
+    # flexible extraction: traverse and collect keys that look like field names
+    def collect_fields(obj):
+        if isinstance(obj, dict):
+            for k,v in obj.items():
+                if k.lower() in ("name","label","columns","column","field","label"):
+                    if isinstance(v, list):
+                        for x in v:
+                            if isinstance(x, str):
+                                json_field_candidates.append(x)
+                    elif isinstance(v, str):
+                        json_field_candidates.append(v)
+                collect_fields(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                collect_fields(item)
+    collect_fields(meta)
+
+    # if empty, try to pick top-level resource column labels
+    if not json_field_candidates:
+        for r in meta.get("resources", []):
+            for col in r.get("columns", []):
+                if col.get("label"):
+                    json_field_candidates.append(col.get("label"))
+
+    # flatten excel columns across sheets
+    all_excel_cols = []
+    for sheet, info in excel_parsed.items():
+        all_excel_cols.extend(info["columns"])
+
+    # 3) mapping
+    mapping = fuzzy_map(json_field_candidates or ["_no_fields_"], all_excel_cols or ["_no_cols_"])
+
+    # 4) basic rules extraction (example from a standard 'reconciliation' key)
+    rules = []
+    for r in meta.get("resources", []):
+        recon = r.get("reconciliation") or {}
+        for rs in recon.get("reconciliation_rule_sets", []) if recon else []:
+            for rr in rs.get("reconciliation_rules", []):
+                rules.append({"expr": f"{rr.get('column_a_id')} {rr.get('operator')} {rr.get('column_b_id')}", "action":"Flag if condition fails"})
+
+    # 5) generate docx
+    out_file = TMP / f"doc_{uuid.uuid4().hex}.docx"
+    title = meta.get("name", "Reconciliation Summary")
+    summary = meta.get("description", "Automatically generated reconciliation summary.")
+    generate_docx(title, summary, excel_parsed, rules, out_file)
+
+    return FileResponse(str(out_file), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename="reconciliation_summary.docx")
+```
+
+Notes:
+
+* This backend saves uploads to `./tmp`, parses JSON fields opportunistically, does a simple fuzzy map, extracts minimal rules (IDs/operators), then produces a Word doc.
+* Replace the `rule_to_plain` and `generate_docx` with richer logic for your use case (handle transformations, vlookups, ifelse, add\_date\_time, etc.).
+
+---
+
+## b) `frontend.py` — Streamlit frontend (single file)
+
+Run as `streamlit run frontend.py` (it will call the backend endpoint above).
+
+```python
+# frontend.py
+import streamlit as st
+import requests
+
+BACKEND_URL = "http://localhost:8000/generate"
+
+st.title("Reconciliation Doc Generator (Prototype)")
+
+st.markdown("Upload your JSON template and Excel technical document. The tool will generate a plain-English Word document summarising data sources and rules.")
+
+json_file = st.file_uploader("Upload JSON template", type=["json"])
+excel_file = st.file_uploader("Upload Excel (xlsx/xls)", type=["xlsx","xls"])
+
+if st.button("Generate Word Document"):
+    if not json_file or not excel_file:
+        st.error("Please upload both files.")
+    else:
+        with st.spinner("Uploading and generating..."):
+            files = {
+                "json_file": (json_file.name, json_file.getvalue(), "application/json"),
+                "excel_file": (excel_file.name, excel_file.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            }
+            resp = requests.post(BACKEND_URL, files=files, stream=True)
+            if resp.status_code == 200:
+                st.success("Generated successfully — click to download")
+                st.download_button("Download .docx", data=resp.content, file_name="reconciliation_summary.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            else:
+                st.error(f"Generation failed: {resp.status_code} {resp.text}")
+```
+
+---
+
+# 4) How the prototype transforms technical content to plain English
+
+* **Field name conversion**: rule-based templates like:
+
+  * `CUST_ID` → “Customer ID from the source system.”
+  * `RATEID` → “Identifier for the exchange rate record.”
+    Implement by split-on-`[_\.\-]`, map common tokens (id → Identifier, dt/date → Date, amt/amount → Amount), use a small dictionary + title-case.
+
+* **Rules / If-Else**:
+
+  * Parse expressions (regex) for common patterns: `IF ... THEN ...`, `ifelse(...)`, `<, >, !=, =`.
+  * Replace operators with natural language and map columns via mapping table to human readable names.
+
+* **Formulas**:
+
+  * Detect Excel formulas via pandas read (if the sheet has formulas saved as text), or extract transformations from JSON (your example file already contains `transformations` objects). Convert simple operations (`concat`, `add_date_time`) into sentences: e.g. `concat(A.AADATE_D)` → “This column concatenates `AADATE_D`.”
+
+* **VLOOKUP / mapping**:
+
+  * When a column has `v_lookup` metadata, explain: “This column maps `origin_value` to `destination_value` using the FROM\_TO\_CURRENCY lookup.”
+
+* **Confidence scores**:
+
+  * Use fuzzy-match scores to annotate uncertain mappings (e.g., score < 70 -> mark as “mapping may need review”).
+
+* **Optional LLM usage**:
+
+  * For complex free-text explanations, call an LLM with prompt like:
+
+    ```
+    "Explain the following transformation in 1-2 sentences for a non-technical auditor: <transformation json>"
+    ```
+  * Cache or allow user editing before final generate.
+
+---
+
+# 5) Next steps I can do for you (choose one)
+
+* A. Draft a **full project architecture diagram + detailed step-by-step development & testing plan** (including files, modules, tests, docker, CI/CD).
+* B. Deliver a **fully fleshed sample codebase**: FastAPI + Streamlit + improved transformer (with better parsing for your uploaded `FX_Solution.json` and `FX_Solution.xlsx`) that reads your specific files and produces a richer Word doc. I will wire in better mapping and more plain-English templates.
+* C. Expand the **rule-to-plain** logic into a library of sentence templates for common operations (concat, v\_lookup, ifelse, add\_date\_time, format changes).
+* D. Convert the prototype into a single Streamlit-only app (no backend) for quicker testing.
+
+Tell me which letter you want (A / B / C / D) and I’ll produce that now. If you pick B, I’ll use the `FX_Solution.json` and `FX_Solution.xlsx` you uploaded and output a tailored `.docx` example (I already see the JSON file content — I can map and convert it).
