@@ -6,7 +6,7 @@ import { z } from "zod";
 export const documents = pgTable("documents", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   name: text("name").notNull(),
-  status: text("status").notNull().default("pending"), // pending, processing, completed, failed
+  status: text("status").notNull().default("pending"), // pending, processing, completed, failed, Ok
   jsonTemplate: jsonb("json_template"),
   excelMetadata: jsonb("excel_metadata"),
   fieldMappings: jsonb("field_mappings"),
